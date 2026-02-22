@@ -1,5 +1,0 @@
-[workspace]
-
-
-members = ["rift-cli", "rift-core", "rift-server"]
-resolver = "3"

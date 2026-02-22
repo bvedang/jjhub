@@ -1,6 +1,6 @@
 # RIFT
 
-## MVP Specification v1.6.1
+## MVP Specification v2.0
 
 _JJ-Native Code Review with Git Compatibility_
 
@@ -9,6 +9,8 @@ _February 2026_
 ---
 
 Git-compatible, not Git-limited. Ship the review UX first, prove it works, then own the hosting story.
+
+**v2.0 change:** Architecture rewritten around TypeScript/Node.js. The product vision, data model, and contracts are unchanged. What changed is _how_ it gets built — optimizing for speed-to-validation over long-term performance. Rust remains the eventual target for the storage engine once the product is proven.
 
 ## 1. Product Vision
 
@@ -68,28 +70,69 @@ Squash merge is the only merge strategy in MVP.
 
 ## 4. Architecture
 
-The original spec called for three layers: a Rust storage engine, a Spring Boot platform layer, and a Next.js frontend. For MVP, we collapse this to two layers. The reasoning is simple: for a small team, every service boundary is a tax. You pay it in deployment complexity, debugging across network hops, and duplicated data models. We can always split later when scaling demands it.
+**v2.0 change:** The original spec called for a Rust backend. For MVP, the entire backend is TypeScript/Node.js. The reasoning: validate the product before optimizing the runtime. TypeScript lets us share types between backend and frontend, move faster on API iteration, and avoid the Rust learning curve blocking shipping. The architecture is designed so the storage-heavy pieces (packfile generation, diff engine) can be extracted to Rust later if performance demands it.
 
 ### 4.1 Two-Layer Architecture
 
-| Layer    | Technology  | Responsibility                                                                                                                |
-| -------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Backend  | Rust (Axum) | Storage engine, platform logic (auth, stacks, reviews, comments, merge), REST API, Git compat endpoint, gRPC internal modules |
-| Frontend | Next.js     | Web UI: repo browser, stack review, DAG visualizer, admin                                                                     |
+| Layer    | Technology                    | Responsibility                                                                                         |
+| -------- | ----------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Backend  | TypeScript (Node.js, Fastify) | Storage engine, platform logic (auth, stacks, reviews, comments, merge), REST API, Git compat endpoint |
+| Frontend | Next.js (React)               | Web UI: repo browser, stack review, DAG visualizer, admin                                              |
 
-**CLI:** Rust. Shares code with the backend (revision graph types, auth). Talks to the backend via REST and directly to the storage module for push/pull.
+**Why Fastify over Express:** Fastify has built-in schema validation via JSON Schema, better TypeScript support, and significantly better performance benchmarks. For an MVP that might need to handle packfile streaming and diff computation, the performance headroom matters.
 
-**Key change from v1.1:** The gRPC boundary between storage and platform becomes a module boundary inside a single Rust binary, not a service boundary. Same process, different modules. Split when you need to scale them independently.
+**CLI:** TypeScript (compiled with `tsx` or bundled with `pkg`/`esbuild`). Shares types with the backend via a shared package. Talks to the backend via REST.
+
+**Monorepo structure:**
+
+```
+rift/
+├── packages/
+│   ├── shared/          # Types, constants, validation schemas
+│   │   └── src/
+│   │       ├── types.ts       # Revision, Change, Stack, etc.
+│   │       ├── errors.ts      # Error codes (Section A.3)
+│   │       └── validation.ts  # Shared validation logic
+│   ├── backend/         # Fastify server
+│   │   └── src/
+│   │       ├── server.ts
+│   │       ├── modules/
+│   │       │   ├── storage/    # Git object storage, S3 interaction
+│   │       │   ├── push/       # Push validation, atomic push
+│   │       │   ├── stacks/     # Stack CRUD, iteration mgmt
+│   │       │   ├── review/     # Reviews, approvals, gating
+│   │       │   ├── diff/       # Diff engine, interdiff
+│   │       │   ├── git/        # Git smart HTTP (clone/fetch)
+│   │       │   ├── mirror/     # Mirror sync, merge-back
+│   │       │   └── auth/       # OAuth, tokens
+│   │       └── db/
+│   │           ├── schema.ts   # Drizzle ORM schema
+│   │           └── migrations/
+│   ├── frontend/        # Next.js app
+│   │   └── src/
+│   │       ├── app/           # App router pages
+│   │       └── components/    # Review UI, diff viewer, DAG
+│   └── cli/             # jj rift CLI
+│       └── src/
+│           ├── commands/
+│           │   ├── auth.ts
+│           │   └── push.ts
+│           └── index.ts
+├── package.json         # Workspace root
+└── turbo.json           # Turborepo config
+```
+
+**Workspace tooling:** pnpm workspaces + Turborepo. This gives us shared types without publishing packages, parallel builds, and good caching.
 
 ### 4.2 Infrastructure
 
-**Postgres:** users, repos, stacks, reviews, comments, permissions.
+**Postgres:** users, repos, stacks, reviews, comments, permissions. Accessed via Drizzle ORM (type-safe, lightweight, good migration story).
 
-**Redis:** graph traversal cache, session cache. Invalidated on push.
+**Redis:** diff cache, session cache. Invalidated on push. Use `ioredis`.
 
-**S3/MinIO:** content-addressed blob storage. Immutable. Only the storage module touches it.
+**S3/MinIO:** content-addressed blob storage for Git objects. Immutable. Only the storage module touches it. Use `@aws-sdk/client-s3`.
 
-**RabbitMQ:** optional for MVP. Use if mirror sync needs async processing. Otherwise, direct calls.
+**Queue (optional for MVP):** BullMQ (Redis-backed) if mirror sync needs async processing. Otherwise, direct calls.
 
 ### 4.3 Storage Object Model
 
@@ -103,9 +146,46 @@ MVP uses Git's object model internally. This is the boring choice, and it's the 
 
 `delta_hash` = SHA-256 of the unified diff output between parent tree and revision tree. Computed on push, stored in Postgres alongside the revision.
 
-**Packfile generation:** for GitUploadPack, the backend reads objects from S3 and assembles packfiles using standard Git pack format. Libraries like gitoxide (gix) handle this in Rust.
+**Git object handling in TypeScript:** Use `isomorphic-git` for reading/writing Git objects (blobs, trees, commits) and computing OIDs. For packfile generation (GitUploadPack), use `isomorphic-git`'s packfile utilities or shell out to `git pack-objects` as a subprocess. The subprocess approach is simpler and correct — optimize later if it becomes a bottleneck.
+
+**Diff computation:** Use `diff` (npm package) or `jsdiff` for line-level unified diffs. For the delta_hash computation, normalize the diff output per the canonicalization rules in Appendix A.1.
+
+**Packfile generation fallback:** If `isomorphic-git`'s packfile support proves insufficient for GitUploadPack, the backend can shell out to `git upload-pack` against a bare repo reconstructed from S3 objects. This is the escape hatch. It's slower but guaranteed correct.
 
 Postgres holds Rift-specific metadata only: stacks, reviews, comments, permissions, tokens. It does not store blob content.
+
+### 4.4 Key Library Choices
+
+| Concern                | Library            | Why                                                     |
+| ---------------------- | ------------------ | ------------------------------------------------------- |
+| HTTP framework         | Fastify            | Fast, schema validation, good TS support                |
+| Database ORM           | Drizzle            | Type-safe, lightweight, SQL-close                       |
+| Git objects            | isomorphic-git     | Pure JS Git implementation, reads/writes objects        |
+| Diff engine            | jsdiff             | Mature line-level diff, sufficient for MVP              |
+| S3 client              | @aws-sdk/client-s3 | Standard                                                |
+| Redis                  | ioredis            | Mature, cluster support                                 |
+| Auth (OAuth)           | @fastify/oauth2    | Fastify-native OAuth plugin                             |
+| Hashing (SHA-256)      | Node.js `crypto`   | Built-in, no dependency needed                          |
+| Encryption (tokens)    | libsodium-wrappers | secretbox for origin credential encryption              |
+| Task queue (if needed) | BullMQ             | Redis-backed, good DX, TS-first                         |
+| Monorepo               | pnpm + Turborepo   | Fast, good workspace support                            |
+| Syntax highlighting    | Shiki (frontend)   | tree-sitter–based, runs in browser, great theme support |
+
+**What about tree-sitter on the backend?** Not needed for MVP. Shiki handles syntax highlighting on the frontend. If we add AST-aware diffing post-MVP, we can add tree-sitter via `node-tree-sitter` or move that module to Rust.
+
+### 4.5 Performance Boundaries and Rust Extraction Path
+
+TypeScript is fast enough for MVP scale (~5 users, tens of repos). But know where the walls are:
+
+**CPU-bound operations that may need Rust later:**
+
+- Packfile generation for large repos (>100k objects)
+- Diff computation on very large files (>10k lines)
+- delta_hash canonicalization at high push volume
+
+**The extraction plan:** Each of these is isolated in its own backend module. When performance matters, compile a Rust binary (via `napi-rs` for Node.js native addon, or as a subprocess). The module interface doesn't change — only the implementation behind it.
+
+**For MVP:** Don't optimize. Shell out to `git` for packfile generation if `isomorphic-git` is slow. Use `jsdiff` for diffs. Measure before rewriting.
 
 ## 5. Dual Workflow Contract
 
@@ -117,7 +197,7 @@ JJ is the primary way to interact with Rift. The CLI supports two commands in MV
 
 `jj rift push` — push revisions and create/update a stack. Stack identity is based on change IDs, not branches.
 
-When a user runs `jj rift push`, the CLI calls the storage module's ValidatePush, then PushRevisions. The platform automatically creates or updates the stack.
+When a user runs `jj rift push`, the CLI calls the backend's push/validate endpoint, then push/revisions. The platform automatically creates or updates the stack.
 
 #### Stack Identity and Update Rules
 
@@ -149,7 +229,7 @@ The interdiff UI uses the iteration counter to let reviewers pick any two iterat
 
 Network failures during push are inevitable. The push protocol must be safe to retry.
 
-**Atomic push:** PushRevisions is all-or-nothing. Either all revisions in the push are stored and the stack is updated, or nothing changes. No partial uploads.
+**Atomic push:** PushRevisions is all-or-nothing. Either all revisions in the push are stored and the stack is updated, or nothing changes. No partial uploads. Implemented as a single Postgres transaction wrapping S3 uploads — if the DB transaction fails, S3 objects are orphaned (cleaned up by a periodic garbage collection job, not needed for MVP).
 
 **Dedupe key:** `(stack_id, iteration, revision_id)`. If the server receives a push with the same stack_id and iteration number and all revision_ids match an already-completed push, it returns success without re-processing. This makes retries safe.
 
@@ -169,6 +249,8 @@ Since MVP enforces linear-only stacks, the CLI must reject pushes that don't fit
 
 The `--base` flag overrides automatic bookmark detection. It lets the author explicitly say "everything between here and that bookmark is my stack." This is the escape hatch for all ambiguous cases.
 
+**CLI implementation note:** The CLI is a TypeScript package compiled to a standalone binary via `esbuild` + `pkg` (or distributed as an npm package). It imports types from `@rift/shared`. The CLI parses `jj log` output to detect the revision chain — it does not embed jj as a library. This keeps the CLI simple and avoids FFI complexity.
+
 ### 5.2 Git: Supported but Constrained
 
 Git users can interact with Rift-hosted repos, but the experience is deliberately limited to preserve Rift's semantics.
@@ -180,6 +262,16 @@ Git users can interact with Rift-hosted repos, but the experience is deliberatel
 | git clone / fetch   | Supported  | Via GitUploadPack (smart HTTP)                |
 | git push (direct)   | Blocked    | No direct pushes to `refs/heads/*`            |
 | git push-for-review | Post-MVP   | `refs/for/<bookmark>` deferred to fast follow |
+
+#### GitUploadPack Implementation
+
+Smart HTTP Git protocol, handled by a dedicated Fastify route (`/repos/:owner/:name.git/info/refs` and `/repos/:owner/:name.git/git-upload-pack`).
+
+**Option A (recommended for MVP):** Shell out to `git upload-pack` against a bare repo. On each request, the backend ensures a bare repo exists on disk (or in a tmpdir) with the correct objects and refs. This is the simplest correct implementation.
+
+**Option B (post-MVP optimization):** Use `isomorphic-git` to generate packfiles in-process from S3 objects. Avoids disk I/O but requires more code.
+
+For MVP, Option A. Keep a local bare repo cache per repository, updated on push and mirror sync. The cache is reconstructable from S3 at any time.
 
 #### Git Refs Exposed
 
@@ -215,11 +307,11 @@ Since the same token is used for CLI auth, Git basic auth, and (separately) mirr
 
 #### Security Boundary
 
-**User tokens:** stored as SHA-256 hashes in `auth_tokens.token_hash`. Plaintext is shown once at creation and never stored. Comparison is hash-to-hash.
+**User tokens:** stored as SHA-256 hashes in `auth_tokens.token_hash`. Plaintext is shown once at creation and never stored. Comparison is hash-to-hash. Use Node.js `crypto.createHash('sha256')`.
 
-**Origin credentials:** encrypted at rest using a server-side key (environment variable or KMS depending on deployment). Decryption happens only in the backend process, only when executing a mirror sync or merge push. Never exposed via API.
+**Origin credentials:** encrypted at rest using `libsodium-wrappers` secretbox with a single server key (environment variable). Decryption happens only in the backend process, only when executing a mirror sync or merge push. Never exposed via API.
 
-**MVP boundary:** libsodium secretbox (or equivalent symmetric encryption) with a single server key is sufficient. KMS integration is a post-MVP hardening step.
+**MVP boundary:** libsodium secretbox with a single server key is sufficient. KMS integration is a post-MVP hardening step.
 
 ## 6. Mirror Mode
 
@@ -234,6 +326,8 @@ This is the most important addition to the spec. Mirror mode lets teams try Rift
 **Review in Rift:** Authors push stacks to Rift using `jj rift push`. Review happens entirely in Rift's UI.
 
 **Merge back:** When a stack is merged in Rift, the merged commit is pushed back to the origin's target bookmark. The origin stays the source of truth for CI, deployments, etc.
+
+**Sync implementation:** Use `simple-git` (Node.js wrapper around the git CLI) for fetch and push operations against the origin. This is simpler and more reliable than implementing the Git protocol in pure JS. The backend spawns `git fetch` and `git push` as child processes with the decrypted origin credentials.
 
 ### 6.2 Data Model Addition
 
@@ -258,14 +352,16 @@ Sync is polling-only in MVP. Webhook-triggered sync is post-MVP (requires the we
 
 **Tracked refs:** MVP syncs the default bookmark only (typically main). Repo owners can configure an allowlist of additional bookmarks to track in repo settings. Tags and all other refs are ignored until post-MVP.
 
+**Polling implementation:** Use `node-cron` or a simple `setInterval` per repo. For MVP scale (tens of repos), this is fine. If it needs to scale, move to BullMQ repeatable jobs.
+
 ### 6.4 Mirror Merge Algorithm
 
 The most dangerous moment in mirror mode is merge time. The origin may have moved since the stack was created. Here's the exact sequence:
 
 1. **Author clicks merge.** The UI sends `POST /v1/repos/:owner/:name/stacks/:id/merge`.
-2. **Rift re-fetches origin.** Before doing anything, Rift pulls the latest state of the target bookmark from the origin. This ensures we're working with the real tip, not a stale cache.
-3. **Compute squash commit.** Rift creates the squash-merge commit with parent = latest origin tip (not the tip from when the stack was created). The commit message combines the stack's revision descriptions.
-4. **Push to origin.** Rift attempts a fast-forward push of the merge commit to the origin's target bookmark.
+2. **Rift re-fetches origin.** Before doing anything, Rift pulls the latest state of the target bookmark from the origin (via `simple-git` fetch). This ensures we're working with the real tip, not a stale cache.
+3. **Compute squash commit.** Rift creates the squash-merge commit with parent = latest origin tip (not the tip from when the stack was created). The commit message combines the stack's revision descriptions. Use `isomorphic-git` to create the commit object.
+4. **Push to origin.** Rift attempts a fast-forward push of the merge commit to the origin's target bookmark (via `simple-git` push).
 5. **If push succeeds:** stack status moves to `merged`. Rift's local bookmark advances. Done.
 6. **If push fails (non-fast-forward):** this means the origin moved between step 2 and step 4. Rift marks the stack as "rebase required" and blocks the merge. The author must pull the latest main, restack locally, and push a new iteration before trying again.
 7. **If the squash commit cannot be computed cleanly** (the stack's changes conflict with new commits on the target bookmark), Rift also marks the stack as "rebase required." The UI shows the conflicting files and instructs the author to rebase locally and re-push. Rift does not attempt automatic conflict resolution in MVP — conflict tooling is a non-goal.
@@ -321,7 +417,7 @@ This section walks through every major workflow end-to-end. If you can't picture
 
 1. **Sign up:** Same OAuth flow.
 2. **Create mirror:** `POST /v1/repos` with `source: mirror` and `origin_url` pointing to the GitHub repo. Provide access credentials.
-3. **Initial sync:** Rift clones the origin. All existing history appears in Rift's revision graph.
+3. **Initial sync:** Rift clones the origin (via `simple-git`). All existing history appears in Rift's revision graph.
 4. **Clone from Rift:** Author clones from Rift (not GitHub) to get the jj-native experience. `jj git clone https://rift/<owner>/<repo>.git`
 5. Team keeps using GitHub for CI/deploys. Rift is the review layer on top.
 
@@ -394,7 +490,7 @@ File tree panel showing changed files in this revision only.
 
 Inline commenting. Click a line to leave a comment. Comments are anchored to this specific revision.
 
-Syntax highlighting using tree-sitter.
+Syntax highlighting using Shiki (tree-sitter–based, runs in the browser).
 
 ### 8.3 Full-Stack Diff View
 
@@ -417,6 +513,41 @@ Per-revision interdiff (what changed in this specific change's delta between ite
 Full-stack interdiff (what changed across all changes' deltas between iterations).
 
 Quick signal: if a revision's `delta_hash` is the same across two iterations, the interdiff is empty and the UI shows "unchanged."
+
+### 8.5 Frontend Diff Component Architecture
+
+The diff viewer is the most complex frontend component. Here's how it breaks down:
+
+**Diff data flow:** Backend computes the diff and returns structured hunks (not raw unified diff text). The API returns JSON with file-level entries, each containing hunks with line-by-line additions/deletions/context. The frontend renders this into a side-by-side or unified view.
+
+**API response shape for diffs:**
+
+```typescript
+interface DiffResponse {
+  files: Array<{
+    path: string;
+    old_path?: string; // set if renamed
+    status: "added" | "modified" | "deleted" | "renamed";
+    hunks: Array<{
+      old_start: number;
+      old_lines: number;
+      new_start: number;
+      new_lines: number;
+      lines: Array<{
+        type: "add" | "delete" | "context";
+        content: string;
+        old_line?: number;
+        new_line?: number;
+      }>;
+    }>;
+    stats: { additions: number; deletions: number };
+  }>;
+}
+```
+
+**Syntax highlighting:** Apply Shiki highlighting per-file on the frontend. Highlight the full file content, then map highlighted tokens back to diff lines. This avoids re-highlighting per hunk.
+
+**Comment anchoring in the UI:** Each line in the diff view has a `(file_path, line_number)` coordinate. Clicking a line opens a comment form that captures `(change_id, revision_id, file_path, line_number)`.
 
 ## 9. Review and Approval Rules
 
@@ -472,19 +603,19 @@ Stacked review lives or dies on diff quality. The diff engine is core infrastruc
 
 ### 10.1 MVP Requirements
 
-**Line-based diffing.** Use imara-diff or similar as the base algorithm. This is the foundation everything else builds on.
+**Line-based diffing.** Use `jsdiff` (structuredPatch / createTwoFilesPatch) as the base algorithm. This is the foundation everything else builds on.
 
-**Syntax highlighting.** Use tree-sitter for display-time highlighting in the diff view. This is not the same as syntax-aware diffing — it's just coloring the output.
+**Syntax highlighting.** Use Shiki on the frontend for display-time highlighting in the diff view. This is not the same as syntax-aware diffing — it's just coloring the output.
 
-**Whitespace handling.** Whitespace-insensitive mode (toggle in UI). Default: show whitespace changes dimmed, not highlighted.
+**Whitespace handling.** Whitespace-insensitive mode (toggle in UI). Default: show whitespace changes dimmed, not highlighted. Implement via `jsdiff`'s `ignoreWhitespace` option for the toggle; rendering is frontend-only.
 
-**File-level rename detection.** Detect files that were moved or renamed within a revision using content-similarity heuristics (same approach as Git's `-M` flag). Show as moves, not delete + create. If detection fails, fall back to showing delete + add — acceptable in MVP.
+**File-level rename detection.** Detect files that were moved or renamed within a revision using content-similarity heuristics (same approach as Git's `-M` flag). Use `isomorphic-git` or shell out to `git diff --find-renames` for this. Show as moves, not delete + create. If detection fails, fall back to showing delete + add — acceptable in MVP.
 
 **Interdiff computation.** Given two iterations of the same change (same change_id, different revision_ids), compute what changed between them. Critical: interdiff must be patch-to-patch, not tree-to-tree. Define Δ_a = `diff(parent_a, revision_a)` and Δ_b = `diff(parent_b, revision_b)`. Interdiff = `diff(Δ_a, Δ_b)`. Tree-to-tree would show noise from base changes on restack.
 
 ### 10.2 Post-MVP
 
-**Syntax-aware structural diffing.** Use tree-sitter ASTs to show logical moves (function moved, block extracted) rather than line-level noise. Hard to do well. Not required for MVP.
+**Syntax-aware structural diffing.** Use tree-sitter ASTs to show logical moves (function moved, block extracted) rather than line-level noise. Hard to do well. Not required for MVP. Can be added via `node-tree-sitter` or extracted to a Rust module.
 
 **Intra-file move detection.** Detect code that moved within a file and show it as a move rather than a delete + insert.
 
@@ -522,7 +653,9 @@ If remapping succeeds, show the comment inline on the new revision with a "carri
 
 ## 12. Data Model
 
-### 12.1 Tables (MVP Minimum)
+### 12.1 Drizzle Schema (MVP Minimum)
+
+The schema uses Drizzle ORM for type safety. Here's the shape — Drizzle schema definitions map directly to these tables.
 
 | Table                   | Key Fields                                                                                                                                                                                                                       |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -541,9 +674,52 @@ If remapping succeeds, show the comment inline on the new revision with a "carri
 | comments                | id, stack_id, author_id, change_id, revision_id, file_path, line_number, body, created_at                                                                                                                                        |
 | merges                  | stack_id, merged_revision_id, merged_at, merged_by                                                                                                                                                                               |
 
+**Drizzle example (stacks table):**
+
+```typescript
+import {
+  pgTable,
+  uuid,
+  text,
+  integer,
+  timestamp,
+  pgEnum,
+} from "drizzle-orm/pg-core";
+
+export const stackStatusEnum = pgEnum("stack_status", [
+  "open",
+  "merged",
+  "closed",
+]);
+export const blockedReasonEnum = pgEnum("blocked_reason", [
+  "rebase_required",
+  "origin_diverged",
+  "conflicts",
+]);
+
+export const stacks = pgTable("stacks", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  repoId: uuid("repo_id")
+    .notNull()
+    .references(() => repositories.id),
+  authorId: uuid("author_id")
+    .notNull()
+    .references(() => users.id),
+  targetBookmark: text("target_bookmark").notNull(),
+  baseRevisionId: text("base_revision_id").notNull(),
+  status: stackStatusEnum("status").notNull().default("open"),
+  blockedReason: blockedReasonEnum("blocked_reason"),
+  currentIteration: integer("current_iteration").notNull().default(1),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+```
+
 ## 13. APIs
 
-### 13.1 REST API (Backend)
+### 13.1 REST API (Fastify Backend)
+
+All routes are defined with Fastify's schema validation using JSON Schema (or TypeBox for type-safe schema definitions). Request/response types are generated from schemas and shared with the frontend via `@rift/shared`.
 
 #### Auth
 
@@ -599,15 +775,60 @@ All list endpoints use cursor-based pagination with the same contract:
 
 **Filters are stable across pages:** the cursor encodes the filter set. Changing a filter requires a new query without a cursor.
 
-### 13.3 Internal gRPC Modules (Same Binary)
+### 13.3 Internal Module Interfaces
 
-These are module interfaces inside the Rust backend, not separate services. Use gRPC-style definitions for clarity, but they're called in-process.
+These are TypeScript module interfaces inside the backend, not separate services. Defined as classes or functions with typed inputs/outputs.
 
-- `PushService.ValidatePush`, `PushService.PushRevisions`
-- `RevisionService.GetRevision`, `GetAncestors`, `GetDescendants`
-- `TreeService.GetTree`, `GetBlob`, `GetDiff`
-- `GitService.GitUploadPack` (Git clone/fetch support)
-- `MirrorService.Sync`, `MirrorService.PushMerge` (mirror mode)
+```typescript
+// packages/backend/src/modules/push/push.service.ts
+interface PushService {
+  validatePush(input: ValidatePushInput): Promise<ValidatePushResult>;
+  pushRevisions(input: PushRevisionsInput): Promise<PushRevisionsResult>;
+}
+
+// packages/backend/src/modules/storage/revision.service.ts
+interface RevisionService {
+  getRevision(repoId: string, revisionId: string): Promise<Revision>;
+  getAncestors(
+    repoId: string,
+    revisionId: string,
+    limit: number,
+  ): Promise<Revision[]>;
+  getDescendants(
+    repoId: string,
+    revisionId: string,
+    limit: number,
+  ): Promise<Revision[]>;
+}
+
+// packages/backend/src/modules/storage/tree.service.ts
+interface TreeService {
+  getTree(
+    repoId: string,
+    revisionId: string,
+    path: string,
+  ): Promise<TreeEntry[]>;
+  getBlob(repoId: string, revisionId: string, path: string): Promise<Buffer>;
+  getDiff(
+    repoId: string,
+    baseId: string,
+    headId: string,
+  ): Promise<DiffResponse>;
+}
+
+// packages/backend/src/modules/git/git.service.ts
+interface GitService {
+  handleUploadPack(repoId: string, request: Request): Promise<Response>;
+}
+
+// packages/backend/src/modules/mirror/mirror.service.ts
+interface MirrorService {
+  sync(repoId: string): Promise<SyncResult>;
+  pushMerge(repoId: string, stackId: string): Promise<MergeResult>;
+}
+```
+
+These interfaces are the extraction boundary. When a module needs to move to Rust (via napi-rs), only the implementation changes — the interface stays the same.
 
 ## 14. Repository Browser
 
@@ -615,9 +836,9 @@ MVP includes a web-based repo browser. It's not the differentiator, but it needs
 
 **File tree:** browsable at any revision. Click through directories, view files.
 
-**Revision graph:** DAG visualizer showing the full history. Highlight stacks in progress.
+**Revision graph:** DAG visualizer showing the full history. Highlight stacks in progress. Use a React component with SVG rendering (libraries like `react-flow` or custom SVG).
 
-**File viewer:** syntax highlighting via tree-sitter. Line numbers. Blame view is post-MVP.
+**File viewer:** syntax highlighting via Shiki. Line numbers. Blame view is post-MVP.
 
 ## 15. Merge Rules
 
@@ -677,21 +898,13 @@ MVP is shippable when all of the following work end-to-end:
 
 ## 18. Open Decisions
 
-These need to be locked in before implementation begins. Almost everything is resolved — the remaining items are operational decisions, not architectural ones.
+These need to be locked in before implementation begins.
 
 **Iteration storage model.** Store full revision snapshots per iteration (simple, more storage) or diffs between iterations (compact, more complexity)? Recommended: full snapshots for MVP. Storage is cheap; debugging is expensive.
 
 **OAuth scope for mirror mode.** What permissions does Rift need on the origin repo? Minimum: read access for sync, write access for push-back on merge. Needs to be tested against both GitHub and GitLab's token permission models.
 
-**Resolved in v1.3:** mirror merge algorithm (6.4), stack update rules (5.1), approval reset policy (9.3), diff engine MVP scope (10.1), Git auth (5.2), sync mechanism (polling-only, 6.3).
-
-**Resolved in v1.4:** CLI failure modes (5.1), stack boundary detection via `--base` (5.1), requested reviewers storage + API (12.1, 13.1), review history across iterations (12.1), dropped revision tracking (12.1), token lifecycle (5.2), mirror tracked refs (6.3).
-
-**Resolved in v1.5:** auth_tokens + origin credentials tables (12.1), blocked_reason for merge failures (12.1, 15), merge permissions aligned (15, 16.1), conflict fail mode in mirror merge (6.4), inbound commit behavior (6.4), stack listing endpoint (13.1).
-
-**Resolved in v1.6:** interdiff semantics (patch-to-patch, 8.4/10.1), delta_hash for change comparison (3.2), change_id authority (3.2), pinned base for display (6.4), mirror sync state machine (6.5), storage object model (4.3), push idempotency (5.1), reviewer request semantics (9.5), security boundary (5.2), browser REST endpoints (13.1), pagination contract (13.2).
-
-**Resolved in v1.6.1:** open_change_claims enforcement (5.1/A.4), stacks.updated_at semantics (12.1/13.2), push endpoints in REST API (13.1/A.5), review submissions are upserts (9.4/13.1), delta_hash canonicalization rules (A.1), and role/Git user flow wording alignment (7.6/16.1).
+**isomorphic-git vs git subprocess.** For the initial prototype, shell out to `git` for anything `isomorphic-git` can't handle cleanly. Measure which operations need native git and which can stay in pure JS. Lock in the boundary before building the GitUploadPack handler.
 
 ## 19. Post-MVP Roadmap (Ordered)
 
@@ -703,12 +916,13 @@ For context on what comes next, roughly in priority order:
 4. Webhook-triggered mirror sync (requires webhooks/events infrastructure)
 5. CI gating (merge requires green checks, external CI integrations)
 6. Virtual rebase for display (compute how patches would look on current base without actual rebase)
-7. Team-based review assignment (review groups, round-robin, code ownership)
-8. Syntax-aware structural diffing (AST-level move detection using tree-sitter)
-9. Conflict dashboard (visualize and resolve conflicts in-browser)
-10. Rebase-merge strategy (alternative to squash)
-11. Webhooks and event streaming
-12. Full-text search across repos
+7. **Rust extraction for performance-critical paths** (packfile generation, diff engine, delta_hash computation via napi-rs)
+8. Team-based review assignment (review groups, round-robin, code ownership)
+9. Syntax-aware structural diffing (AST-level move detection using tree-sitter)
+10. Conflict dashboard (visualize and resolve conflicts in-browser)
+11. Rebase-merge strategy (alternative to squash)
+12. Webhooks and event streaming
+13. Full-text search across repos
 
 ## Appendix A: Implementation Contracts
 
@@ -722,7 +936,7 @@ revision_id:  Git commit OID (SHA-1 hex, 40 chars)
 
 change_id:    JJ change ID (hex string, from client)
               Authoritative: JJ produces it, server stores it
-              For mirror-synced commits: server generates a UUID
+              For mirror-synced commits: server generates a UUID (crypto.randomUUID())
 
 tree_hash:    Git tree OID (SHA-1 hex)
               Changes on restack even if patch is identical
@@ -738,14 +952,14 @@ Compute raw delta = `diff(parent, revision)` (linear parent) and normalize:
 - Order files lexicographically by path.
 - For binary changes, include the literal string: `BINARY <old_blob_oid> <new_blob_oid>`.
 
-`delta_hash = sha256(normalized_delta)`
+`delta_hash = sha256(normalized_delta)` — computed via `crypto.createHash('sha256')`.
 
 Stable across restacks if the change delta (added/removed lines) is identical.
 
 Used for: interdiff, "unchanged" detection, cache keys.
 
 ```
-stack_id:     UUID v4 (server-generated on first push)
+stack_id:     UUID v4 (server-generated on first push via crypto.randomUUID())
               Stored locally by CLI in jj workspace metadata
 ```
 
@@ -754,6 +968,8 @@ stack_id:     UUID v4 (server-generated on first push)
 #### Per-Revision Diff
 
 The diff for a single revision R is always computed as `diff(parent(R), R)` where parent is the linear parent in the stack. This is the "change delta" — what this revision actually changed.
+
+**Implementation:** Fetch both trees from S3 (via `isomorphic-git` or git subprocess), compute unified diff using `jsdiff.structuredPatch()` per file. Return structured `DiffResponse` (see 8.5).
 
 #### Full-Stack Diff
 
@@ -789,6 +1005,28 @@ Quick path: if `delta_hash_a == delta_hash_b`, interdiff is empty. UI shows "unc
 | 422  | unapproved_revisions | Merge attempted but not all revisions approved         |
 | 502  | origin_unreachable   | Mirror sync or merge push failed to reach origin       |
 
+**Fastify error handling:** Use a custom error handler plugin that maps these to consistent JSON responses:
+
+```typescript
+// packages/shared/src/errors.ts
+export class RiftError extends Error {
+  constructor(
+    public code: number,
+    public errorKey: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+// Usage in route handler:
+throw new RiftError(
+  409,
+  "change_conflict",
+  `change_id ${changeId} belongs to stack ${existingStackId}`,
+);
+```
+
 ### A.4 Key Database Constraints and Indexes
 
 ```sql
@@ -821,22 +1059,24 @@ CREATE UNIQUE INDEX idx_token_hash
   ON auth_tokens(token_hash) WHERE revoked_at IS NULL;
 ```
 
+**Drizzle migration note:** Define these indexes in the Drizzle schema file. Run `drizzle-kit generate` to produce SQL migrations, then `drizzle-kit migrate` to apply.
+
 ### A.5 Push Protocol Sequence
 
 ```
-Client (jj rift push)           Server (Rift backend)
+Client (jj rift push)           Server (Fastify backend)
 
 1. Detect stack boundary
    (revs between WC and base)
 
-2. POST /v1/repos/:owner/:name/push/validate -------> ValidatePush:
+2. POST /v1/repos/:owner/:name/push/validate -------> validatePush():
    { stack_id?, change_ids[],     - check auth + role
      revision_ids[] }             - check one-stack-per-change
                                   - check linear chain
                  <-------------- { ok: true, iteration: N }
 
-3. POST /v1/repos/:owner/:name/push/revisions ------> PushRevisions (atomic):
-   { stack_id, iteration: N,      - store git objects to S3
+3. POST /v1/repos/:owner/:name/push/revisions ------> pushRevisions() (atomic):
+   { stack_id, iteration: N,      - upload git objects to S3
      revisions: [                 - compute delta_hash per rev
        { rev_id, change_id,       - insert stack_revisions rows
          tree_hash, parent,       - increment current_iteration
@@ -850,4 +1090,39 @@ Client (jj rift push)           Server (Rift backend)
    (jj workspace metadata)
 ```
 
+**Atomicity in TypeScript:** Wrap steps in `pushRevisions()` in a Drizzle transaction (`db.transaction(async (tx) => { ... })`). S3 uploads happen first (outside the transaction); if the DB transaction fails, orphaned S3 objects are harmless and can be cleaned up later.
+
 **Retry safety:** if step 3 times out and the client retries with the same stack_id and iteration N, the server checks if that iteration already exists with matching revision_ids. If yes, returns success. If revision_ids differ, returns `409 iteration_conflict`.
+
+## Appendix B: Development Setup
+
+Quick-start for contributors:
+
+```bash
+# Prerequisites: Node.js 20+, pnpm 9+, Docker (for Postgres/Redis/MinIO)
+
+# Clone and install
+git clone https://github.com/vedang/rift.git
+cd rift
+pnpm install
+
+# Start infrastructure
+docker compose up -d  # Postgres, Redis, MinIO
+
+# Run migrations
+pnpm --filter @rift/backend db:migrate
+
+# Start dev servers (Turborepo runs all packages in parallel)
+pnpm dev
+
+# Backend: http://localhost:3001
+# Frontend: http://localhost:3000
+```
+
+**Docker Compose services:**
+
+- `postgres:16` on port 5432
+- `redis:7` on port 6379
+- `minio` on port 9000 (S3-compatible)
+
+**Environment variables:** Copy `.env.example` to `.env`. Key variables: `DATABASE_URL`, `REDIS_URL`, `S3_ENDPOINT`, `S3_BUCKET`, `ENCRYPTION_KEY` (for origin credentials), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`.
